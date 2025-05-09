@@ -46,6 +46,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use serde_derive::Deserialize;
 use crate::jwt;
 
 #[derive(Clone, Debug)]
@@ -73,6 +74,8 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
+
+static AUTHORIZED_SERVER_HOST: &str = "http://666.agrtc.cc/api/rust";
 
 #[derive(Clone)]
 struct Inner {
@@ -102,6 +105,30 @@ enum LoopFailure {
     Listener3,
     Listener2,
     Listener,
+}
+
+
+enum AuthorizedServerRequest {
+    Bind,
+    Verify,
+}
+
+impl AuthorizedServerRequest {
+    fn url(&self) -> String {
+        let host = std::env::var("AUTHORIZED_SERVER_HOST")
+            .unwrap_or_else(|_| AUTHORIZED_SERVER_HOST.to_string());
+
+        match self {
+            AuthorizedServerRequest::Bind => format!("{host}/bind"),
+            AuthorizedServerRequest::Verify => format!("{host}/create"),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct AuthorizedServerResponse {
+    code: i8,
+    msg: String,
 }
 
 impl RendezvousServer {
@@ -196,7 +223,7 @@ impl RendezvousServer {
                 "N"
             }
         );
-        if test_addr.to_lowercase() != "no" {
+        if test_addr.to_lowercase() == "yes" {
             let test_addr = if test_addr.is_empty() {
                 listener.local_addr()?
             } else {
@@ -354,8 +381,9 @@ impl RendezvousServer {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    log::info!("Register peer: {}", rp.id);
                     // B registered
-                    if !rp.id.is_empty() {
+                    if !rp.id.is_empty() && !rp.code.is_empty(){
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
@@ -370,6 +398,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    log::info!("Register Pk {:?}", rk);
                     if rk.uuid.is_empty() || rk.pk.is_empty() {
                         return Ok(());
                     }
@@ -455,6 +484,7 @@ impl RendezvousServer {
                     socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
+                    log::info!("Punch Hole Request {:?}", ph);
                     if self.pm.is_in_memory(&ph.id).await {
                         self.handle_udp_punch_hole_request(addr, ph, key).await?;
                     } else {
@@ -467,12 +497,15 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
+                    log::info!("Punch Hole Sent {:?}", phs);
                     self.handle_hole_sent(phs, addr, Some(socket)).await?;
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
+                    log::info!("Local addr {:?}", la);
                     self.handle_local_addr(la, addr, Some(socket)).await?;
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
+                    log::info!("Configure Update {:?}", cu);
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
                         let mut inner: Inner = (*self.inner).clone();
                         inner.serial = cu.serial;
@@ -503,6 +536,54 @@ impl RendezvousServer {
                         socket.send(&msg_out, addr).await?;
                     }
                 }
+                Some(rendezvous_message::Union::BindCodeRequest(bcr)) => {
+                    log::info!("BindCodeRequest {:?}", bcr);
+                    let mut params = HashMap::new();
+                    params.insert("device_id", bcr.device_id.clone());
+                    params.insert("code", bcr.code.clone());
+
+                    let resp = reqwest::Client::new()
+                        .post(AuthorizedServerRequest::Bind.url())
+                        .header("User-Agent", "rust")
+                        .form(&params)
+                        .send()
+                        .await;
+
+                    let mut msg_out = RendezvousMessage::new();
+                    let result;
+                    let msg;
+
+                    if let Ok(resp) = resp {
+                        let resp = resp
+                            // .bytes()
+                            .json::<AuthorizedServerResponse>()
+                            .await;
+                        log::info!("Authorized Server Response: {:?}", resp);
+                        if let Ok(resp) = resp {
+                            // result = bind_code_response::Result::FAILED;
+                            // msg = String::from("错误");
+                            result = match resp.code {
+                                1 => bind_code_response::Result::OK,
+                                _ => bind_code_response::Result::FAILED
+                            };
+                            msg = resp.msg;
+                        } else {
+                            result = bind_code_response::Result::FAILED;
+                            msg = String::from("数据解析错误");
+                        }
+                    } else {
+                        result = bind_code_response::Result::SERVER_ERROR;
+                        msg = String::from("服务器错误");
+                    }
+                    msg_out.set_bind_code_response(BindCodeResponse {
+                        result: result.into(),
+                        msg,
+                        code: bcr.code.clone(),
+                        device_id: bcr.device_id.clone(),
+                        ..Default::default()
+                    });
+                    socket.send(&msg_out, addr).await?;
+                }
                 _ => {}
             }
         }
@@ -522,6 +603,7 @@ impl RendezvousServer {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
+                    log::info!("Punch Hole Request {:?}", ph);
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
@@ -530,6 +612,7 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     // there maybe several attempt, so sink can be none
+                    log::info!("Request Relay {:?}", rf);
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
@@ -543,6 +626,7 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
+                    log::info!("Relay Response {:?}", rr);
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
                     let id = rr.id();
@@ -563,12 +647,15 @@ impl RendezvousServer {
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
+                    log::info!("Punch Hole Sent {:?}", phs);
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
+                    log::info!("local Addr {:?}", la);
                     allow_err!(self.handle_local_addr(la, addr, None).await);
                 }
                 Some(rendezvous_message::Union::TestNatRequest(tar)) => {
+                    log::info!("Test Nat Request {:?}", tar);
                     let mut msg_out = RendezvousMessage::new();
                     let mut res = TestNatResponse {
                         port: addr.port() as _,
@@ -593,6 +680,7 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                    log::info!("Key exchange {:?}", ex);
                     log::trace!("KeyExchange {:?} <- bytes: {:?}", addr, hex::encode(&bytes));
                     if ex.keys.len() != 2 {
                         log::error!("Handshake failed: invalid phase 2 key exchange message");
@@ -624,6 +712,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                    log::info!("Online Request {:?}", or);
                     let mut states = self.peers_online_state(or.peers).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_online_response(OnlineResponse {
@@ -781,6 +870,55 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
+
+        log::info!("handle punch hole request code:{} device_id: {}", ph.code.clone(), ph.device_id.clone());
+        if ph.code.is_empty() || ph.device_id.is_empty() {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: String::from("Code or DeviceId Error"),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        } else {
+            let mut params = HashMap::new();
+            params.insert("device_id", ph.device_id);
+            params.insert("code", ph.code);
+
+            let resp = reqwest::Client::new()
+                .post(AuthorizedServerRequest::Verify.url())
+                .header("User-Agent", "rust")
+                .form(&params)
+                .send()
+                .await;
+
+            let mut msg_out = RendezvousMessage::new();
+            let mut response = PunchHoleResponse {
+                ..Default::default()
+            };
+
+            if let Ok(resp) = resp {
+                let resp = resp
+                    .json::<AuthorizedServerResponse>()
+                    .await;
+                log::info!("Punch Hole Authorized Server Response: {:?}", resp);
+                if let Ok(resp) = resp {
+                    if resp.code != 1 {
+                        response.other_failure = resp.msg;
+                        msg_out.set_punch_hole_response(response);
+                        return Ok((msg_out, None));
+                    }
+                } else {
+                    response.other_failure = String::from("Decode Error");
+                    msg_out.set_punch_hole_response(response);
+                    return Ok((msg_out, None));
+                }
+            } else {
+                response.other_failure = String::from("Authorized Server Error");
+                msg_out.set_punch_hole_response(response);
+                return Ok((msg_out, None));
+            }
+        }
+        
         // if secret is not empty check token by jwt
         if MUST_LOGIN.load(Ordering::SeqCst) {
             if ph.token.is_empty() {
